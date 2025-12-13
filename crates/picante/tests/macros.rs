@@ -1,7 +1,4 @@
-use picante::{
-    DynIngredient, HasRuntime, IngredientLookup, IngredientRegistry, PicanteResult, Runtime,
-};
-use std::sync::Arc;
+use picante::PicanteResult;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static LEN_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -40,94 +37,8 @@ pub struct Word {
     pub text: String,
 }
 
-struct Db {
-    runtime: Runtime,
-    ingredients: IngredientRegistry<Db>,
-    text_keys: Arc<TextKeysIngredient>,
-    text_data: Arc<TextDataIngredient>,
-    len: Arc<LenQuery<Db>>,
-    sum: Arc<SumQuery<Db>>,
-    unit_key: Arc<UnitKeyQuery<Db>>,
-    word: Arc<WordIngredient>,
-}
-
-impl Db {
-    fn new() -> Self {
-        let runtime = Runtime::new();
-        let mut ingredients = IngredientRegistry::new();
-
-        let text_keys = make_text_keys();
-        let text_data = make_text_data();
-        let len = make_len_query::<Db>();
-        let sum = make_sum_query::<Db>();
-        let unit_key = make_unit_key_query::<Db>();
-        let word = make_word_ingredient();
-
-        ingredients.register(text_keys.clone());
-        ingredients.register(text_data.clone());
-        ingredients.register(len.clone());
-        ingredients.register(sum.clone());
-        ingredients.register(unit_key.clone());
-        ingredients.register(word.clone());
-
-        Self {
-            runtime,
-            ingredients,
-            text_keys,
-            text_data,
-            len,
-            sum,
-            unit_key,
-            word,
-        }
-    }
-}
-
-impl HasRuntime for Db {
-    fn runtime(&self) -> &Runtime {
-        &self.runtime
-    }
-}
-
-impl IngredientLookup for Db {
-    fn ingredient(&self, kind: picante::QueryKindId) -> Option<&dyn DynIngredient<Self>> {
-        self.ingredients.ingredient(kind)
-    }
-}
-
-impl HasTextIngredient for Db {
-    fn text_keys(&self) -> &TextKeysIngredient {
-        &self.text_keys
-    }
-
-    fn text_data(&self) -> &TextDataIngredient {
-        &self.text_data
-    }
-}
-
-impl HasLenQuery for Db {
-    fn len_query(&self) -> &LenQuery<Self> {
-        &self.len
-    }
-}
-
-impl HasSumQuery for Db {
-    fn sum_query(&self) -> &SumQuery<Self> {
-        &self.sum
-    }
-}
-
-impl HasUnitKeyQuery for Db {
-    fn unit_key_query(&self) -> &UnitKeyQuery<Self> {
-        &self.unit_key
-    }
-}
-
-impl HasWordIngredient for Db {
-    fn word_ingredient(&self) -> &WordIngredient {
-        &self.word
-    }
-}
+#[picante::db(inputs(Text), interned(Word), tracked(len, sum, unit_key))]
+struct Db {}
 
 #[tokio::test(flavor = "current_thread")]
 async fn macros_basic_flow() -> PicanteResult<()> {
