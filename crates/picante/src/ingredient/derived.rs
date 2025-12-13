@@ -442,6 +442,56 @@ where
     pub fn snapshot(&self) -> im::HashMap<K, Arc<Cell<V>>> {
         self.cells.read().clone()
     }
+
+    /// Load cells from a snapshot into this ingredient.
+    ///
+    /// This is used when creating database snapshots. Existing cells are replaced.
+    pub fn load_cells(&self, cells: im::HashMap<K, Arc<Cell<V>>>) {
+        *self.cells.write() = cells;
+    }
+
+    /// Create a deep snapshot of this ingredient's cells.
+    ///
+    /// Unlike `snapshot()` which shares `Arc<Cell>` references, this method
+    /// creates new `Cell` instances with cloned Ready states. This ensures
+    /// the snapshot's cells are independent of the original and won't be
+    /// affected by subsequent updates to the original.
+    ///
+    /// Cells that are not Ready (Vacant, Running, Poisoned) are not included
+    /// in the snapshot since they represent transient or invalid states.
+    pub async fn snapshot_cells_deep(&self) -> im::HashMap<K, Arc<Cell<V>>>
+    where
+        V: Clone,
+    {
+        // Collect all cells under lock, then release before async work
+        let cells_snapshot: Vec<(K, Arc<Cell<V>>)> = {
+            let cells = self.cells.read();
+            cells.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
+
+        let mut result = im::HashMap::new();
+
+        for (key, cell) in cells_snapshot {
+            let state = cell.state.lock().await;
+            if let State::Ready {
+                value,
+                verified_at,
+                changed_at,
+                deps,
+            } = &*state
+            {
+                let new_cell = Arc::new(Cell::new_ready(
+                    value.clone(),
+                    *verified_at,
+                    *changed_at,
+                    deps.clone(),
+                ));
+                result.insert(key, new_cell);
+            }
+        }
+
+        result
+    }
 }
 
 /// A memoization cell for a single query key.

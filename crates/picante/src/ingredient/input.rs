@@ -177,6 +177,22 @@ where
     pub fn snapshot(&self) -> im::HashMap<K, InputEntry<V>> {
         self.entries.read().clone()
     }
+
+    /// Create a new ingredient initialized from a snapshot.
+    ///
+    /// This is used when creating database snapshots. The returned ingredient
+    /// contains the same data as the snapshot but is independent of the original.
+    pub fn new_from_snapshot(
+        kind: QueryKindId,
+        kind_name: &'static str,
+        entries: im::HashMap<K, InputEntry<V>>,
+    ) -> Self {
+        Self {
+            kind,
+            kind_name,
+            entries: RwLock::new(entries),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Facet)]
