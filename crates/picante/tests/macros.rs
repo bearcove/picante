@@ -38,12 +38,17 @@ pub struct Word {
 }
 
 #[picante::db(inputs(Text), interned(Word), tracked(len, sum, unit_key))]
-struct Db {}
+struct Db {
+    pub config: u32,
+    pub enabled: bool,
+}
 
 #[tokio::test(flavor = "current_thread")]
 async fn macros_basic_flow() -> PicanteResult<()> {
     LEN_CALLS.store(0, Ordering::Relaxed);
-    let db = Db::new();
+    let db = Db::new(123, true);
+    assert_eq!(db.config, 123);
+    assert!(db.enabled);
     let text = Text::new(&db, "a".into(), "hello".into())?;
 
     assert_eq!(len(&db, text).await?, 5);
@@ -58,7 +63,7 @@ async fn macros_tuple_keys_and_unit_key() -> PicanteResult<()> {
     SUM_CALLS.store(0, Ordering::Relaxed);
     UNIT_CALLS.store(0, Ordering::Relaxed);
 
-    let db = Db::new();
+    let db = Db::new(0, false);
 
     assert_eq!(sum(&db, 1, 2).await?, 3);
     assert_eq!(sum(&db, 1, 2).await?, 3);
@@ -77,7 +82,7 @@ async fn macros_tuple_keys_and_unit_key() -> PicanteResult<()> {
 
 #[tokio::test(flavor = "current_thread")]
 async fn macros_interned_works() -> PicanteResult<()> {
-    let db = Db::new();
+    let db = Db::new(0, false);
 
     let w1 = Word::new(&db, "hello".to_string())?;
     let w2 = Word::new(&db, "hello".to_string())?;

@@ -163,6 +163,8 @@ pub struct Database {
 }
 ```
 
+`inputs(...)` can also be written as `input(...)`.
+
 ### Macro generates:
 
 ```rust
