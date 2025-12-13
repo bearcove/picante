@@ -31,7 +31,9 @@ impl ItemPath {
                 TokenTree::Ident(_) => {}
                 TokenTree::Punct(p) if p.as_char() == ':' => {}
                 _ => {
-                    return Err("picante: expected a path like `foo::Bar` (no generics)".to_string());
+                    return Err(
+                        "picante: expected a path like `foo::Bar` (no generics)".to_string()
+                    );
                 }
             }
         }

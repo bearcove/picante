@@ -86,3 +86,48 @@ async fn macros_interned_works() -> PicanteResult<()> {
 
     Ok(())
 }
+
+mod db_paths {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    #[picante::input]
+    pub struct Text2 {
+        #[key]
+        pub key: String,
+        pub value: String,
+    }
+
+    #[picante::tracked]
+    pub async fn len2<DB: HasText2Ingredient>(db: &DB, text: Text2) -> PicanteResult<u64> {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        Ok(text.value(db)?.len() as u64)
+    }
+
+    #[picante::interned]
+    pub struct Word2 {
+        pub text: String,
+    }
+
+    #[picante::db(inputs(self::Text2), interned(self::Word2), tracked(self::len2))]
+    pub struct Db2 {}
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_macro_accepts_paths() -> PicanteResult<()> {
+        CALLS.store(0, Ordering::Relaxed);
+        let db = Db2::new();
+        let text = Text2::new(&db, "a".into(), "hello".into())?;
+
+        assert_eq!(len2(&db, text).await?, 5);
+        assert_eq!(len2(&db, text).await?, 5);
+        assert_eq!(CALLS.load(Ordering::Relaxed), 1);
+
+        let w1 = Word2::new(&db, "hello".to_string())?;
+        let w2 = Word2::new(&db, "hello".to_string())?;
+        assert_eq!(w1, w2);
+
+        Ok(())
+    }
+}
