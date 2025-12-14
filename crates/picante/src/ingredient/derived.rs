@@ -17,137 +17,37 @@ use tracing::{debug, trace};
 type ComputeFuture<'db, V> = BoxFuture<'db, PicanteResult<V>>;
 type ComputeFn<DB, K, V> = dyn for<'db> Fn(&'db DB, K) -> ComputeFuture<'db, V> + Send + Sync;
 
-/// A memoized async derived query ingredient.
+// ============================================================================
+// Non-generic core: state machine compiled ONCE
+// ============================================================================
+
+/// Non-generic core containing the type-erased state machine.
 ///
-/// Uses `im::HashMap` with `RwLock` internally. This enables O(1) snapshot cloning
-/// via structural sharing, at the cost of requiring explicit locking (compared to
-/// lock-free `DashMap`). The trade-off favors snapshot efficiency for database
-/// state capture and time-travel debugging scenarios.
-pub struct DerivedIngredient<DB, K, V>
-where
-    K: Clone + Eq + Hash,
-{
+/// By keeping this struct non-generic and making its methods generic over parameters,
+/// we compile the 300+ line state machine ONCE instead of per-(DB,K,V) combination.
+struct DerivedCore {
     kind: QueryKindId,
     kind_name: &'static str,
-    /// Type-erased cell storage using DynKey for reduced monomorphization.
-    /// This single HashMap is compiled once instead of per-(K,V) combination.
     cells: RwLock<im::HashMap<DynKey, Arc<ErasedCell>>>,
-    /// Maintains type information for API while using erased storage.
-    cells_phantom: PhantomData<(K, V)>,
-    compute: Arc<ComputeFn<DB, K, V>>,
 }
 
-impl<DB, K, V> DerivedIngredient<DB, K, V>
-where
-    DB: IngredientLookup + Send + Sync + 'static,
-    K: Clone + Eq + Hash + Facet<'static> + Send + Sync + 'static,
-    V: Clone + Facet<'static> + Send + Sync + 'static,
-{
-    /// Create a new derived ingredient.
-    pub fn new(
-        kind: QueryKindId,
-        kind_name: &'static str,
-        compute: impl for<'db> Fn(&'db DB, K) -> ComputeFuture<'db, V> + Send + Sync + 'static,
-    ) -> Self {
+impl DerivedCore {
+    fn new(kind: QueryKindId, kind_name: &'static str) -> Self {
         Self {
             kind,
             kind_name,
             cells: RwLock::new(im::HashMap::new()),
-            cells_phantom: PhantomData,
-            compute: Arc::new(compute),
         }
     }
 
-    /// The stable kind id.
-    pub fn kind(&self) -> QueryKindId {
-        self.kind
-    }
-
-    /// Debug name for this ingredient.
-    pub fn kind_name(&self) -> &'static str {
-        self.kind_name
-    }
-
-    /// Get the value for `key` at the database's current revision.
-    pub async fn get(&self, db: &DB, key: K) -> PicanteResult<V> {
-        // Encode key once (avoids re-encoding on every lookup)
-        let dyn_key = DynKey {
-            kind: self.kind,
-            key: Key::encode_facet(&key)?,
-        };
-
-        // Ensure we have a task-local query stack (required for cycle detection + dep tracking).
-        let result = frame::scope_if_needed(|| async {
-            // Call type-erased core with properly lifetime-bound closure.
-            // The closure must be Fn (not FnOnce) since the loop may retry.
-            self.access_scoped_erased(db, dyn_key.clone(), true, || async {
-                // This closure captures db and key by reference (correct lifetime, NOT 'static!)
-                let value: V = (self.compute)(db, key.clone()).await?;
-                // Wrap as Arc<dyn Any> for erased storage
-                Ok(Arc::new(value) as Arc<dyn std::any::Any + Send + Sync>)
-            })
-            .await
-        })
-        .await?;
-
-        // Downcast at the boundary - MUST succeed due to type safety
-        let arc_any = result.value.ok_or_else(|| {
-            Arc::new(PicanteError::Panic {
-                message: format!(
-                    "[BUG] expected value but got None for key {:?}",
-                    dyn_key
-                ),
-            })
-        })?;
-
-        // Downcast Arc<dyn Any> → Arc<V>
-        let arc_v = arc_any.downcast::<V>().map_err(|any| {
-            Arc::new(PicanteError::Panic {
-                message: format!(
-                    "[BUG] type mismatch in get() for ingredient {}: expected {}, got TypeId {:?}",
-                    self.kind_name,
-                    std::any::type_name::<V>(),
-                    (&*any as &dyn std::any::Any).type_id()
-                ),
-            })
-        })?;
-
-        // Extract V from Arc (try_unwrap if sole owner, else clone)
-        let value = Arc::try_unwrap(arc_v).unwrap_or_else(|arc| (*arc).clone());
-
-        Ok(value)
-    }
-
-    /// Ensure the value is valid at the current revision and return its `changed_at`.
-    pub async fn touch(&self, db: &DB, key: K) -> PicanteResult<Revision> {
-        // Encode key once
-        let dyn_key = DynKey {
-            kind: self.kind,
-            key: Key::encode_facet(&key)?,
-        };
-
-        // Ensure we have a task-local query stack (required for cycle detection + dep tracking).
-        // Note: touch may still compute/revalidate; it just doesn't return the value to the caller.
-        let result = frame::scope_if_needed(|| async {
-            self.access_scoped_erased(db, dyn_key, false, || async {
-                let value: V = (self.compute)(db, key.clone()).await?;
-                Ok(Arc::new(value) as Arc<dyn std::any::Any + Send + Sync>)
-            })
-            .await
-        })
-        .await?;
-
-        Ok(result.changed_at)
-    }
-
-    /// Type-erased state machine implementation (compiled ONCE for all query types).
+    /// Type-erased state machine implementation (compiled ONCE).
     ///
     /// IMPORTANT: This method is generic over the future type F to preserve proper
     /// lifetime bounds. The closure `compute_erased` must capture `db: &DB` with its
     /// original lifetime - using BoxFuture<'static> would require unsafe lifetime extension.
     /// The closure is `Fn` (not `FnOnce`) because the loop may need to retry computation
     /// if the revision changes.
-    async fn access_scoped_erased<F>(
+    async fn access_scoped_erased<DB, F>(
         &self,
         db: &DB,
         requested: DynKey,
@@ -155,6 +55,7 @@ where
         compute_erased: impl Fn() -> F,
     ) -> PicanteResult<ErasedAccessResult>
     where
+        DB: IngredientLookup + Send + Sync + 'static,
         F: std::future::Future<Output = PicanteResult<Arc<dyn std::any::Any + Send + Sync>>> + Send,
     {
         let key_hash = requested.key.hash();
@@ -456,14 +357,17 @@ where
         }
     }
 
-    async fn try_revalidate(
+    async fn try_revalidate<DB>(
         &self,
         db: &DB,
         requested: &DynKey,
         rev: Revision,
         deps: &Arc<[Dep]>,
         self_changed_at: Revision,
-    ) -> PicanteResult<bool> {
+    ) -> PicanteResult<bool>
+    where
+        DB: IngredientLookup + Send + Sync + 'static,
+    {
         trace!(
             kind = self.kind.0,
             key_hash = %format!("{:016x}", requested.key.hash()),
@@ -487,20 +391,143 @@ where
 
         Ok(true)
     }
+}
+
+// ============================================================================
+// Thin generic wrapper (one per DB/K/V, but minimal code)
+// ============================================================================
+
+/// A memoized async derived query ingredient.
+///
+/// This is a thin wrapper around `DerivedCore` that handles key encoding
+/// and value downcasting. The heavy state machine logic is in the core, which
+/// is compiled once instead of per (DB, K, V) combination.
+pub struct DerivedIngredient<DB, K, V>
+where
+    K: Clone + Eq + Hash,
+{
+    /// Non-generic core containing the type-erased state machine
+    core: DerivedCore,
+    /// Type information for K and V
+    _phantom: PhantomData<(DB, K, V)>,
+    /// Compute function for this specific query type
+    compute: Arc<ComputeFn<DB, K, V>>,
+}
+
+impl<DB, K, V> DerivedIngredient<DB, K, V>
+where
+    DB: IngredientLookup + Send + Sync + 'static,
+    K: Clone + Eq + Hash + Facet<'static> + Send + Sync + 'static,
+    V: Clone + Facet<'static> + Send + Sync + 'static,
+{
+    /// Create a new derived ingredient.
+    pub fn new(
+        kind: QueryKindId,
+        kind_name: &'static str,
+        compute: impl for<'db> Fn(&'db DB, K) -> ComputeFuture<'db, V> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            core: DerivedCore::new(kind, kind_name),
+            _phantom: PhantomData,
+            compute: Arc::new(compute),
+        }
+    }
+
+    /// The stable kind id.
+    pub fn kind(&self) -> QueryKindId {
+        self.core.kind
+    }
+
+    /// Debug name for this ingredient.
+    pub fn kind_name(&self) -> &'static str {
+        self.core.kind_name
+    }
+
+    /// Get the value for `key` at the database's current revision.
+    pub async fn get(&self, db: &DB, key: K) -> PicanteResult<V> {
+        // Encode key once (avoids re-encoding on every lookup)
+        let dyn_key = DynKey {
+            kind: self.core.kind,
+            key: Key::encode_facet(&key)?,
+        };
+
+        // Ensure we have a task-local query stack (required for cycle detection + dep tracking).
+        let result = frame::scope_if_needed(|| async {
+            // Call type-erased core with properly lifetime-bound closure.
+            // The closure must be Fn (not FnOnce) since the loop may retry.
+            self.core.access_scoped_erased(db, dyn_key.clone(), true, || async {
+                // This closure captures db and key by reference (correct lifetime, NOT 'static!)
+                let value: V = (self.compute)(db, key.clone()).await?;
+                // Wrap as Arc<dyn Any> for erased storage
+                Ok(Arc::new(value) as Arc<dyn std::any::Any + Send + Sync>)
+            })
+            .await
+        })
+        .await?;
+
+        // Downcast at the boundary - MUST succeed due to type safety
+        let arc_any = result.value.ok_or_else(|| {
+            Arc::new(PicanteError::Panic {
+                message: format!(
+                    "[BUG] expected value but got None for key {:?}",
+                    dyn_key
+                ),
+            })
+        })?;
+
+        // Downcast Arc<dyn Any> → Arc<V>
+        let arc_v = arc_any.downcast::<V>().map_err(|any| {
+            Arc::new(PicanteError::Panic {
+                message: format!(
+                    "[BUG] type mismatch in get() for ingredient {}: expected {}, got TypeId {:?}",
+                    self.core.kind_name,
+                    std::any::type_name::<V>(),
+                    (&*any as &dyn std::any::Any).type_id()
+                ),
+            })
+        })?;
+
+        // Extract V from Arc (try_unwrap if sole owner, else clone)
+        let value = Arc::try_unwrap(arc_v).unwrap_or_else(|arc| (*arc).clone());
+
+        Ok(value)
+    }
+
+    /// Ensure the value is valid at the current revision and return its `changed_at`.
+    pub async fn touch(&self, db: &DB, key: K) -> PicanteResult<Revision> {
+        // Encode key once
+        let dyn_key = DynKey {
+            kind: self.core.kind,
+            key: Key::encode_facet(&key)?,
+        };
+
+        // Ensure we have a task-local query stack (required for cycle detection + dep tracking).
+        // Note: touch may still compute/revalidate; it just doesn't return the value to the caller.
+        let result = frame::scope_if_needed(|| async {
+            self.core.access_scoped_erased(db, dyn_key, false, || async {
+                let value: V = (self.compute)(db, key.clone()).await?;
+                Ok(Arc::new(value) as Arc<dyn std::any::Any + Send + Sync>)
+            })
+            .await
+        })
+        .await?;
+
+        Ok(result.changed_at)
+    }
 
     /// Create a snapshot of this ingredient's cells.
     ///
     /// This is an O(1) operation due to structural sharing in `im::HashMap`.
     /// The returned map shares structure with the live ingredient.
     pub fn snapshot(&self) -> im::HashMap<DynKey, Arc<ErasedCell>> {
-        self.cells.read().clone()
+        self.core.cells.read().clone()
     }
 
     /// Load cells from a snapshot into this ingredient.
     ///
     /// This is used when creating database snapshots. Existing cells are replaced.
     pub fn load_cells(&self, cells: im::HashMap<DynKey, Arc<ErasedCell>>) {
-        *self.cells.write() = cells;
+        *self.core.cells.write() = cells;
     }
 
     /// Create a deep snapshot of this ingredient's cells.
@@ -521,7 +548,7 @@ where
     {
         // Collect all cells under lock, then release before async work
         let cells_snapshot: Vec<(DynKey, Arc<ErasedCell>)> = {
-            let cells = self.cells.read();
+            let cells = self.core.cells.read();
             cells.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
         };
 
@@ -646,11 +673,11 @@ where
     V: Clone + Facet<'static> + Send + Sync + 'static,
 {
     fn kind(&self) -> QueryKindId {
-        self.kind
+        self.core.kind
     }
 
     fn kind_name(&self) -> &'static str {
-        self.kind_name
+        self.core.kind_name
     }
 
     fn section_type(&self) -> SectionType {
@@ -658,7 +685,7 @@ where
     }
 
     fn clear(&self) {
-        let mut cells = self.cells.write();
+        let mut cells = self.core.cells.write();
         *cells = im::HashMap::new();
     }
 
@@ -666,7 +693,7 @@ where
         Box::pin(async move {
             // Collect snapshot under lock, then release before async work
             let snapshot: Vec<(DynKey, Arc<ErasedCell>)> = {
-                let cells = self.cells.read();
+                let cells = self.core.cells.read();
                 cells.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
             };
             let mut records = Vec::with_capacity(snapshot.len());
@@ -677,7 +704,7 @@ where
                     Arc::new(PicanteError::Panic {
                         message: format!(
                             "[BUG] failed to decode key for ingredient {} during save: {:?}",
-                            self.kind_name, e
+                            self.core.kind_name, e
                         ),
                     })
                 })?;
@@ -699,7 +726,7 @@ where
                         message: format!(
                             "[BUG] type mismatch in save_records for ingredient {}: \
                              expected {}, got TypeId {:?}",
-                            self.kind_name,
+                            self.core.kind_name,
                             std::any::type_name::<V>(),
                             (&**value as &dyn std::any::Any).type_id()
                         ),
@@ -731,7 +758,7 @@ where
                 records.push(bytes);
             }
             debug!(
-                kind = self.kind.0,
+                kind = self.core.kind.0,
                 records = records.len(),
                 "save_records (derived)"
             );
@@ -760,7 +787,7 @@ where
 
             // Create DynKey from K
             let dyn_key = DynKey {
-                kind: self.kind,
+                kind: self.core.kind,
                 key: Key::encode_facet(&rec.key)?,
             };
 
@@ -773,7 +800,7 @@ where
                 Revision(rec.changed_at),
                 deps,
             ));
-            let mut cells = self.cells.write();
+            let mut cells = self.core.cells.write();
             cells.insert(dyn_key, cell);
         }
         Ok(())
@@ -786,7 +813,7 @@ where
         Box::pin(async move {
             // Collect snapshot under lock, then release before async work
             let snapshot: Vec<(DynKey, Arc<ErasedCell>)> = {
-                let cells = self.cells.read();
+                let cells = self.core.cells.read();
                 cells.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
             };
 
@@ -799,7 +826,7 @@ where
                 runtime.update_query_deps(dyn_key, deps.clone());
             }
 
-            debug!(kind = self.kind.0, "restore_runtime_state (derived)");
+            debug!(kind = self.core.kind.0, "restore_runtime_state (derived)");
             Ok(())
         })
     }
