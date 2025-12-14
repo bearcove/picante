@@ -79,10 +79,7 @@ where
         return false;
     };
 
-    matches!(
-        facet_assert::check_same(a, b),
-        facet_assert::Sameness::Same
-    )
+    matches!(facet_assert::check_same(a, b), facet_assert::Sameness::Same)
 }
 
 // ============================================================================
@@ -280,7 +277,9 @@ impl DerivedCore {
                 let mut state = cell.state.lock().await;
                 match &*state {
                     ErasedState::Ready { verified_at, .. } if *verified_at == rev => (false, None), // raced
-                    ErasedState::Poisoned { verified_at, .. } if *verified_at == rev => (false, None), // raced
+                    ErasedState::Poisoned { verified_at, .. } if *verified_at == rev => {
+                        (false, None)
+                    } // raced
                     ErasedState::Running { .. } => (false, None), // someone else started
                     _ => {
                         let old = std::mem::replace(
@@ -331,11 +330,7 @@ impl DerivedCore {
                             let is_same = Arc::ptr_eq(&prev_value, &out)
                                 || eq_erased(prev_value.as_ref(), out.as_ref());
 
-                            if is_same {
-                                prev_changed_at
-                            } else {
-                                rev
-                            }
+                            if is_same { prev_changed_at } else { rev }
                         }
                         None => rev,
                     };
@@ -545,10 +540,7 @@ where
         // Downcast at the boundary - MUST succeed due to type safety
         let arc_any = result.value.ok_or_else(|| {
             Arc::new(PicanteError::Panic {
-                message: format!(
-                    "[BUG] expected value but got None for key {:?}",
-                    dyn_key
-                ),
+                message: format!("[BUG] expected value but got None for key {:?}", dyn_key),
             })
         })?;
 
@@ -582,13 +574,7 @@ where
         // Note: touch may still compute/revalidate; it just doesn't return the value to the caller.
         let result = frame::scope_if_needed(|| async {
             self.core
-                .access_scoped_erased(
-                    db,
-                    dyn_key,
-                    false,
-                    self.compute.as_ref(),
-                    self.eq_erased,
-                )
+                .access_scoped_erased(db, dyn_key, false, self.compute.as_ref(), self.eq_erased)
                 .await
         })
         .await?;
@@ -621,7 +607,7 @@ where
     /// Cells that are not Ready (Vacant, Running, Poisoned) are not included
     /// in the snapshot since they represent transient or invalid states.
     ///
-    /// With type-erased storage, cloning is cheap: Arc<dyn Any> clone just
+    /// With type-erased storage, cloning is cheap: `Arc<dyn Any>` clone just
     /// bumps the refcount, avoiding deep clone of the value itself.
     pub async fn snapshot_cells_deep(&self) -> im::HashMap<DynKey, Arc<ErasedCell>>
     where

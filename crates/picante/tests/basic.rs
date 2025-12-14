@@ -465,7 +465,7 @@ async fn changed_at_stable_when_value_unchanged() {
             Box::pin(async move {
                 executions.fetch_add(1, Ordering::SeqCst);
                 let value = input.get(db, &key)?.expect("missing input");
-                Ok(value % 10)  // Only last digit matters
+                Ok(value % 10) // Only last digit matters
             })
         },
     ));
@@ -483,8 +483,8 @@ async fn changed_at_stable_when_value_unchanged() {
     // Change input to 52 - this forces recompute, but output is still 2
     input.set(&db, "x".into(), 52);
     let v2 = derived.get(&db, "x".into()).await.unwrap();
-    assert_eq!(v2, 2);  // Same value!
-    assert_eq!(executions.load(Ordering::SeqCst), 2);  // But we did recompute
+    assert_eq!(v2, 2); // Same value!
+    assert_eq!(executions.load(Ordering::SeqCst), 2); // But we did recompute
 
     // Get the changed_at revision after recompute
     let changed_at_2 = derived.touch(&db, "x".into()).await.unwrap();
@@ -499,7 +499,7 @@ async fn changed_at_stable_when_value_unchanged() {
     // Now change to a different value
     input.set(&db, "x".into(), 47);
     let v3 = derived.get(&db, "x".into()).await.unwrap();
-    assert_eq!(v3, 7);  // Different value
+    assert_eq!(v3, 7); // Different value
     assert_eq!(executions.load(Ordering::SeqCst), 3);
 
     let changed_at_3 = derived.touch(&db, "x".into()).await.unwrap();

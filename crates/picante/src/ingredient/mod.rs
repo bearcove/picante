@@ -9,6 +9,6 @@ mod interned;
 ///
 /// Note: as of the type-erased derived-query implementation, derived cells are no longer generic
 /// over the stored value type.
-pub use derived::{ErasedCell as DerivedCell, DerivedIngredient};
+pub use derived::{DerivedIngredient, ErasedCell as DerivedCell};
 pub use input::{InputEntry, InputIngredient};
 pub use interned::{InternId, InternedIngredient};
