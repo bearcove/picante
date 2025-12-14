@@ -1,7 +1,7 @@
 use picante::db::{DynIngredient, IngredientLookup, IngredientRegistry};
 use picante::error::PicanteError;
 use picante::ingredient::{DerivedIngredient, InputIngredient};
-use picante::key::QueryKindId;
+use picante::key::{DynKey, Key, QueryKindId};
 use picante::persist::{load_cache, save_cache};
 use picante::runtime::{HasRuntime, Runtime};
 use std::sync::Arc;
@@ -383,7 +383,11 @@ async fn derived_snapshot_captures_cells() {
 
     // Snapshot contains the cell
     assert_eq!(snapshot.len(), 1);
-    assert!(snapshot.get(&"a".to_string()).is_some());
+    let a_key = DynKey {
+        kind: derived.kind(),
+        key: Key::encode_facet(&"a".to_string()).unwrap(),
+    };
+    assert!(snapshot.get(&a_key).is_some());
 }
 
 #[tokio::test]
@@ -422,8 +426,16 @@ async fn derived_snapshot_remains_valid_after_modification() {
 
     // Snapshot still has only the original cell
     assert_eq!(snapshot.len(), 1);
-    assert!(snapshot.get(&"a".to_string()).is_some());
-    assert!(snapshot.get(&"b".to_string()).is_none());
+    let a_key = DynKey {
+        kind: derived.kind(),
+        key: Key::encode_facet(&"a".to_string()).unwrap(),
+    };
+    let b_key = DynKey {
+        kind: derived.kind(),
+        key: Key::encode_facet(&"b".to_string()).unwrap(),
+    };
+    assert!(snapshot.get(&a_key).is_some());
+    assert!(snapshot.get(&b_key).is_none());
 
     // Live ingredient has both
     let live_snapshot = derived.snapshot();

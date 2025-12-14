@@ -4,8 +4,7 @@ use crate::frame::{self, ActiveFrameHandle};
 use crate::key::{Dep, DynKey, Key, QueryKindId};
 use crate::persist::{PersistableIngredient, SectionType};
 use crate::revision::Revision;
-use facet::{Def, Facet, KnownPointer, PtrConst};
-use facet_assert::{Sameness, check_same};
+use facet::Facet;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use parking_lot::RwLock;
@@ -17,37 +16,6 @@ use tracing::{debug, trace};
 
 type ComputeFuture<'db, V> = BoxFuture<'db, PicanteResult<V>>;
 type ComputeFn<DB, K, V> = dyn for<'db> Fn(&'db DB, K) -> ComputeFuture<'db, V> + Send + Sync;
-
-struct AccessResult<V> {
-    value: Option<V>,
-    changed_at: Revision,
-}
-
-#[inline]
-fn is_same_known_pointer_allocation<V: Facet<'static>>(left: &V, right: &V) -> bool {
-    let Def::Pointer(pointer_def) = V::SHAPE.def else {
-        return false;
-    };
-
-    match pointer_def.known {
-        Some(KnownPointer::Arc | KnownPointer::Rc | KnownPointer::Box) => {}
-        _ => return false,
-    };
-
-    let Some(borrow_fn) = pointer_def.vtable.borrow_fn else {
-        return false;
-    };
-
-    let left_ptr = PtrConst::new_sized(left as *const V);
-    let right_ptr = PtrConst::new_sized(right as *const V);
-
-    // SAFETY: `left_ptr`/`right_ptr` are valid `*const V` pointers, and `borrow_fn` is only
-    // invoked for Facet-known pointer types (`Arc`/`Rc`/`Box`) where `borrow_fn` is present.
-    let left_pointee = unsafe { borrow_fn(left_ptr) };
-    let right_pointee = unsafe { borrow_fn(right_ptr) };
-
-    left_pointee.raw_ptr() == right_pointee.raw_ptr()
-}
 
 /// A memoized async derived query ingredient.
 ///
@@ -108,16 +76,19 @@ where
             key: Key::encode_facet(&key)?,
         };
 
-        // Call type-erased core with properly lifetime-bound closure
-        // The closure must be Fn (not FnOnce) since the loop may retry
-        let result = self
-            .access_scoped_erased(db, dyn_key.clone(), true, || async {
+        // Ensure we have a task-local query stack (required for cycle detection + dep tracking).
+        let result = frame::scope_if_needed(|| async {
+            // Call type-erased core with properly lifetime-bound closure.
+            // The closure must be Fn (not FnOnce) since the loop may retry.
+            self.access_scoped_erased(db, dyn_key.clone(), true, || async {
                 // This closure captures db and key by reference (correct lifetime, NOT 'static!)
                 let value: V = (self.compute)(db, key.clone()).await?;
                 // Wrap as Arc<dyn Any> for erased storage
                 Ok(Arc::new(value) as Arc<dyn std::any::Any + Send + Sync>)
             })
-            .await?;
+            .await
+        })
+        .await?;
 
         // Downcast at the boundary - MUST succeed due to type safety
         let arc_any = result.value.ok_or_else(|| {
@@ -155,14 +126,16 @@ where
             key: Key::encode_facet(&key)?,
         };
 
-        // touch() doesn't need to compute, so provide a dummy closure
-        let result = self
-            .access_scoped_erased(db, dyn_key, false, || async {
-                Err(Arc::new(PicanteError::Panic {
-                    message: "[BUG] touch should not compute".into(),
-                }))
+        // Ensure we have a task-local query stack (required for cycle detection + dep tracking).
+        // Note: touch may still compute/revalidate; it just doesn't return the value to the caller.
+        let result = frame::scope_if_needed(|| async {
+            self.access_scoped_erased(db, dyn_key, false, || async {
+                let value: V = (self.compute)(db, key.clone()).await?;
+                Ok(Arc::new(value) as Arc<dyn std::any::Any + Send + Sync>)
             })
-            .await?;
+            .await
+        })
+        .await?;
 
         Ok(result.changed_at)
     }
@@ -649,61 +622,6 @@ impl ErasedCell {
 struct ErasedAccessResult {
     value: Option<Arc<dyn std::any::Any + Send + Sync>>,
     changed_at: Revision,
-}
-
-// ============================================================================
-// Original typed cell structures (will be deprecated gradually)
-// ============================================================================
-
-/// A memoization cell for a single query key.
-///
-/// Contains the cached state (vacant, running, ready, or poisoned).
-///
-/// Note: Trait bounds (`Clone`, `Facet<'static>`, `Send`, `Sync`) are enforced
-/// on the `DerivedIngredient` impl blocks where `Cell<V>` is used, not on this
-/// struct definition. This follows Rust best practice of placing bounds on impls
-/// rather than type definitions.
-pub struct Cell<V> {
-    state: Mutex<State<V>>,
-    notify: Notify,
-}
-
-impl<V> Cell<V> {
-    fn new() -> Self {
-        Self {
-            state: Mutex::new(State::Vacant),
-            notify: Notify::new(),
-        }
-    }
-
-    fn new_ready(value: V, verified_at: Revision, changed_at: Revision, deps: Arc<[Dep]>) -> Self {
-        Self {
-            state: Mutex::new(State::Ready {
-                value,
-                verified_at,
-                changed_at,
-                deps,
-            }),
-            notify: Notify::new(),
-        }
-    }
-}
-
-enum State<V> {
-    Vacant,
-    Running {
-        started_at: Revision,
-    },
-    Ready {
-        value: V,
-        verified_at: Revision,
-        changed_at: Revision,
-        deps: Arc<[Dep]>,
-    },
-    Poisoned {
-        error: Arc<PicanteError>,
-        verified_at: Revision,
-    },
 }
 
 #[derive(Debug, Clone, Facet)]
