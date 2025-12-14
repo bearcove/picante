@@ -8,6 +8,7 @@ use facet::Facet;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use parking_lot::RwLock;
+use std::any::Any;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -16,6 +17,73 @@ use tracing::{debug, trace};
 
 type ComputeFuture<'db, V> = BoxFuture<'db, PicanteResult<V>>;
 type ComputeFn<DB, K, V> = dyn for<'db> Fn(&'db DB, K) -> ComputeFuture<'db, V> + Send + Sync;
+
+// ============================================================================
+// Type-erased compute infrastructure (for dyn dispatch)
+// ============================================================================
+
+/// Type-erased Arc<dyn Any> for storing values without knowing V
+type ArcAny = Arc<dyn Any + Send + Sync>;
+
+/// Type-erased compute future that returns ArcAny
+type ComputeFut<'a> = BoxFuture<'a, PicanteResult<ArcAny>>;
+
+/// Function pointer for deep equality check without knowing V
+type EqErasedFn = fn(&dyn Any, &dyn Any) -> bool;
+
+/// Trait for type-erased compute function (dyn dispatch)
+///
+/// This trait allows the state machine to call compute() without being generic
+/// over the closure/future type F. Each query implements this via TypedCompute<DB,K,V>.
+trait ErasedCompute<DB>: Send + Sync {
+    /// Compute the value for a given key, returning type-erased result
+    fn compute<'a>(&'a self, db: &'a DB, key: Key) -> ComputeFut<'a>;
+}
+
+/// Typed adapter that implements ErasedCompute for a specific (DB, K, V)
+///
+/// This is the small per-query wrapper that boxes the future and erases types.
+/// The state machine in DerivedCore stays monomorphic by calling through the trait.
+struct TypedCompute<DB, K, V> {
+    f: Arc<ComputeFn<DB, K, V>>,
+    _phantom: PhantomData<(K, V)>,
+}
+
+impl<DB, K, V> ErasedCompute<DB> for TypedCompute<DB, K, V>
+where
+    DB: IngredientLookup + Send + Sync + 'static,
+    K: Facet<'static> + Send + Sync + 'static,
+    V: Send + Sync + 'static,
+{
+    fn compute<'a>(&'a self, db: &'a DB, key: Key) -> ComputeFut<'a> {
+        Box::pin(async move {
+            let k: K = key.decode_facet()?;
+            let v: V = (self.f)(db, k).await?;
+            Ok(Arc::new(v) as ArcAny)
+        })
+    }
+}
+
+/// Deep equality helper for type-erased values
+///
+/// Uses facet_assert::check_same to perform deep equality comparison on values
+/// without the state machine needing to know the concrete type V.
+fn eq_erased_for<V>(a: &dyn Any, b: &dyn Any) -> bool
+where
+    V: Facet<'static> + 'static,
+{
+    let Some(a) = a.downcast_ref::<V>() else {
+        return false;
+    };
+    let Some(b) = b.downcast_ref::<V>() else {
+        return false;
+    };
+
+    matches!(
+        facet_assert::check_same(a, b),
+        facet_assert::Sameness::Same
+    )
+}
 
 // ============================================================================
 // Non-generic core: state machine compiled ONCE
@@ -40,23 +108,23 @@ impl DerivedCore {
         }
     }
 
-    /// Type-erased state machine implementation (compiled ONCE).
+    /// Type-erased state machine implementation (compiled ONCE per DB type).
     ///
-    /// IMPORTANT: This method is generic over the future type F to preserve proper
-    /// lifetime bounds. The closure `compute_erased` must capture `db: &DB` with its
-    /// original lifetime - using BoxFuture<'static> would require unsafe lifetime extension.
-    /// The closure is `Fn` (not `FnOnce`) because the loop may need to retry computation
-    /// if the revision changes.
-    async fn access_scoped_erased<DB, F>(
+    /// This method uses trait objects (dyn ErasedCompute) instead of generic closures,
+    /// so it compiles once per DB type instead of per-(DB,K,V) combination.
+    ///
+    /// Runtime cost: one vtable call + one BoxFuture allocation per compute.
+    /// Compile-time win: 50+ copies reduced to ~2 copies (DB + DatabaseSnapshot).
+    async fn access_scoped_erased<DB>(
         &self,
         db: &DB,
         requested: DynKey,
         want_value: bool,
-        compute_erased: impl Fn() -> F,
+        compute: &dyn ErasedCompute<DB>,
+        eq_erased: EqErasedFn,
     ) -> PicanteResult<ErasedAccessResult>
     where
         DB: IngredientLookup + Send + Sync + 'static,
-        F: std::future::Future<Output = PicanteResult<Arc<dyn std::any::Any + Send + Sync>>> + Send,
     {
         let key_hash = requested.key.hash();
 
@@ -246,7 +314,8 @@ impl DerivedCore {
                 "compute: start"
             );
 
-            let result = std::panic::AssertUnwindSafe(compute_erased())
+            // Call compute through trait object (dyn dispatch)
+            let result = std::panic::AssertUnwindSafe(compute.compute(db, requested.key.clone()))
                 .catch_unwind()
                 .await;
 
@@ -257,13 +326,10 @@ impl DerivedCore {
                 Ok(Ok(out)) => {
                     let changed_at = match prev {
                         Some((prev_value, prev_changed_at)) => {
-                            // With Arc<dyn Any>, use Arc pointer equality for sameness check.
-                            // This is conservative: values are only considered "same" if they're
-                            // the exact same Arc allocation. Without access to the concrete type V,
-                            // we can't do deep value comparison like check_same() does.
-                            // This means more queries may be marked as "changed" than before,
-                            // but it's safe and correct.
-                            let is_same = Arc::ptr_eq(&prev_value, &out);
+                            // Fast path: pointer equality (values are literally the same Arc)
+                            // Slow path: deep equality via eq_erased function pointer
+                            let is_same = Arc::ptr_eq(&prev_value, &out)
+                                || eq_erased(prev_value.as_ref(), out.as_ref());
 
                             if is_same {
                                 prev_changed_at
@@ -409,9 +475,11 @@ where
     /// Non-generic core containing the type-erased state machine
     core: DerivedCore,
     /// Type information for K and V
-    _phantom: PhantomData<(DB, K, V)>,
-    /// Compute function for this specific query type
-    compute: Arc<ComputeFn<DB, K, V>>,
+    _phantom: PhantomData<(K, V)>,
+    /// Type-erased compute function (trait object for dyn dispatch)
+    compute: Arc<dyn ErasedCompute<DB>>,
+    /// Deep equality function for detecting value changes
+    eq_erased: EqErasedFn,
 }
 
 impl<DB, K, V> DerivedIngredient<DB, K, V>
@@ -426,10 +494,18 @@ where
         kind_name: &'static str,
         compute: impl for<'db> Fn(&'db DB, K) -> ComputeFuture<'db, V> + Send + Sync + 'static,
     ) -> Self {
+        // Create typed adapter and erase to trait object
+        let typed_compute = TypedCompute {
+            f: Arc::new(compute),
+            _phantom: PhantomData,
+        };
+        let compute_erased: Arc<dyn ErasedCompute<DB>> = Arc::new(typed_compute);
+
         Self {
             core: DerivedCore::new(kind, kind_name),
             _phantom: PhantomData,
-            compute: Arc::new(compute),
+            compute: compute_erased,
+            eq_erased: eq_erased_for::<V>,
         }
     }
 
@@ -453,15 +529,16 @@ where
 
         // Ensure we have a task-local query stack (required for cycle detection + dep tracking).
         let result = frame::scope_if_needed(|| async {
-            // Call type-erased core with properly lifetime-bound closure.
-            // The closure must be Fn (not FnOnce) since the loop may retry.
-            self.core.access_scoped_erased(db, dyn_key.clone(), true, || async {
-                // This closure captures db and key by reference (correct lifetime, NOT 'static!)
-                let value: V = (self.compute)(db, key.clone()).await?;
-                // Wrap as Arc<dyn Any> for erased storage
-                Ok(Arc::new(value) as Arc<dyn std::any::Any + Send + Sync>)
-            })
-            .await
+            // Call type-erased core with trait object (dyn dispatch)
+            self.core
+                .access_scoped_erased(
+                    db,
+                    dyn_key.clone(),
+                    true,
+                    self.compute.as_ref(),
+                    self.eq_erased,
+                )
+                .await
         })
         .await?;
 
@@ -504,11 +581,15 @@ where
         // Ensure we have a task-local query stack (required for cycle detection + dep tracking).
         // Note: touch may still compute/revalidate; it just doesn't return the value to the caller.
         let result = frame::scope_if_needed(|| async {
-            self.core.access_scoped_erased(db, dyn_key, false, || async {
-                let value: V = (self.compute)(db, key.clone()).await?;
-                Ok(Arc::new(value) as Arc<dyn std::any::Any + Send + Sync>)
-            })
-            .await
+            self.core
+                .access_scoped_erased(
+                    db,
+                    dyn_key,
+                    false,
+                    self.compute.as_ref(),
+                    self.eq_erased,
+                )
+                .await
         })
         .await?;
 
