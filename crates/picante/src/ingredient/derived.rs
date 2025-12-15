@@ -1,6 +1,7 @@
 use crate::db::{DynIngredient, IngredientLookup, Touch};
 use crate::error::{PicanteError, PicanteResult};
 use crate::frame::{self, ActiveFrameHandle};
+use crate::inflight::{self, InFlightKey, InFlightState, TryLeadResult};
 use crate::key::{Dep, DynKey, Key, QueryKindId};
 use crate::persist::{PersistableIngredient, SectionType};
 use crate::revision::Revision;
@@ -302,117 +303,246 @@ impl DerivedCore {
                 continue;
             }
 
-            // 3) run compute under an active frame
-            let frame = ActiveFrameHandle::new(requested.clone(), rev);
-            let _guard = frame::push_frame(frame.clone());
+            // 3) Check global in-flight registry for cross-snapshot deduplication.
+            //    This allows concurrent queries from different snapshots to share work.
+            let inflight_key = InFlightKey {
+                runtime_id: db.runtime().id(),
+                revision: rev,
+                kind: self.kind,
+                key_hash,
+            };
 
-            debug!(
-                kind = self.kind.0,
-                key_hash = %format!("{:016x}", key_hash),
-                rev = rev.0,
-                "compute: start"
-            );
+            match inflight::try_lead(inflight_key.clone()) {
+                TryLeadResult::Follower(entry) => {
+                    // Another snapshot is already computing this query.
+                    // Wait for it to complete and use its result.
+                    trace!(
+                        kind = self.kind.0,
+                        key_hash = %format!("{:016x}", key_hash),
+                        rev = rev.0,
+                        "inflight: follower, waiting for leader"
+                    );
 
-            // Call compute through trait object (dyn dispatch)
-            let result = std::panic::AssertUnwindSafe(compute.compute(db, requested.key.clone()))
-                .catch_unwind()
-                .await;
+                    // Reset our local cell to Vacant since we didn't actually start computing.
+                    {
+                        let mut state = cell.state.lock().await;
+                        *state = ErasedState::Vacant;
+                    }
 
-            let deps: Arc<[Dep]> = frame.take_deps().into();
+                    // Wait for the leader to complete.
+                    loop {
+                        let entry_state = entry.state();
+                        match entry_state {
+                            InFlightState::Running => {
+                                // Still computing, wait for notification.
+                                entry.wait().await;
+                            }
+                            InFlightState::Done {
+                                value,
+                                deps,
+                                changed_at,
+                            } => {
+                                // Leader completed successfully.
+                                // Populate our local cell with the result.
+                                trace!(
+                                    kind = self.kind.0,
+                                    key_hash = %format!("{:016x}", key_hash),
+                                    rev = rev.0,
+                                    "inflight: follower got result from leader"
+                                );
 
-            // 4) finalize
-            match result {
-                Ok(Ok(out)) => {
-                    let changed_at = match prev {
-                        Some((prev_value, prev_changed_at)) => {
-                            // Fast path: pointer equality (values are literally the same Arc)
-                            // Slow path: deep equality via eq_erased function pointer
-                            let is_same = Arc::ptr_eq(&prev_value, &out)
-                                || eq_erased(prev_value.as_ref(), out.as_ref());
+                                let out_value = want_value.then(|| value.clone());
+                                let mut state = cell.state.lock().await;
+                                *state = ErasedState::Ready {
+                                    value,
+                                    verified_at: rev,
+                                    changed_at,
+                                    deps,
+                                };
+                                drop(state);
+                                cell.notify.notify_waiters();
 
-                            if is_same { prev_changed_at } else { rev }
+                                if db.runtime().current_revision() == rev {
+                                    return Ok(ErasedAccessResult {
+                                        value: out_value,
+                                        changed_at,
+                                    });
+                                }
+                                // Revision changed, retry the main loop.
+                                break;
+                            }
+                            InFlightState::Failed(err) => {
+                                // Leader failed with an error.
+                                trace!(
+                                    kind = self.kind.0,
+                                    key_hash = %format!("{:016x}", key_hash),
+                                    rev = rev.0,
+                                    "inflight: follower got error from leader"
+                                );
+
+                                let mut state = cell.state.lock().await;
+                                *state = ErasedState::Poisoned {
+                                    error: err.clone(),
+                                    verified_at: rev,
+                                };
+                                drop(state);
+                                cell.notify.notify_waiters();
+
+                                if db.runtime().current_revision() == rev {
+                                    return Err(err);
+                                }
+                                break;
+                            }
+                            InFlightState::Cancelled => {
+                                // Leader was cancelled. We should retry and potentially
+                                // become the new leader.
+                                trace!(
+                                    kind = self.kind.0,
+                                    key_hash = %format!("{:016x}", key_hash),
+                                    rev = rev.0,
+                                    "inflight: leader cancelled, will retry"
+                                );
+                                break;
+                            }
                         }
-                        None => rev,
-                    };
-
-                    db.runtime()
-                        .update_query_deps(requested.clone(), deps.clone());
-                    if changed_at == rev {
-                        db.runtime().notify_query_changed(rev, requested.clone());
                     }
-
-                    let out_value = want_value.then(|| out.clone());
-                    let mut state = cell.state.lock().await;
-                    *state = ErasedState::Ready {
-                        value: out,
-                        verified_at: rev,
-                        changed_at,
-                        deps,
-                    };
-                    drop(state);
-                    cell.notify.notify_waiters();
-
-                    debug!(
-                        kind = self.kind.0,
-                        key_hash = %format!("{:016x}", key_hash),
-                        rev = rev.0,
-                        "compute: ok"
-                    );
-
-                    // 5) stale check
-                    if db.runtime().current_revision() == rev {
-                        return Ok(ErasedAccessResult {
-                            value: out_value,
-                            changed_at,
-                        });
-                    }
+                    // Continue the main loop (retry or handle revision change).
                     continue;
                 }
-                Ok(Err(err)) => {
-                    let mut state = cell.state.lock().await;
-                    *state = ErasedState::Poisoned {
-                        error: err.clone(),
-                        verified_at: rev,
-                    };
-                    drop(state);
-                    cell.notify.notify_waiters();
+                TryLeadResult::Leader(guard) => {
+                    // We're the leader. Proceed with computation.
+                    trace!(
+                        kind = self.kind.0,
+                        key_hash = %format!("{:016x}", key_hash),
+                        rev = rev.0,
+                        "inflight: leader, computing"
+                    );
+
+                    // Run compute under an active frame.
+                    let frame = ActiveFrameHandle::new(requested.clone(), rev);
+                    let _frame_guard = frame::push_frame(frame.clone());
 
                     debug!(
                         kind = self.kind.0,
                         key_hash = %format!("{:016x}", key_hash),
                         rev = rev.0,
-                        "compute: err"
+                        "compute: start"
                     );
 
-                    if db.runtime().current_revision() == rev {
-                        return Err(err);
+                    // Call compute through trait object (dyn dispatch)
+                    let result =
+                        std::panic::AssertUnwindSafe(compute.compute(db, requested.key.clone()))
+                            .catch_unwind()
+                            .await;
+
+                    let deps: Arc<[Dep]> = frame.take_deps().into();
+
+                    // 4) finalize
+                    match result {
+                        Ok(Ok(out)) => {
+                            let changed_at = match prev {
+                                Some((prev_value, prev_changed_at)) => {
+                                    // Fast path: pointer equality (values are literally the same Arc)
+                                    // Slow path: deep equality via eq_erased function pointer
+                                    let is_same = Arc::ptr_eq(&prev_value, &out)
+                                        || eq_erased(prev_value.as_ref(), out.as_ref());
+
+                                    if is_same { prev_changed_at } else { rev }
+                                }
+                                None => rev,
+                            };
+
+                            db.runtime()
+                                .update_query_deps(requested.clone(), deps.clone());
+                            if changed_at == rev {
+                                db.runtime().notify_query_changed(rev, requested.clone());
+                            }
+
+                            let out_value = want_value.then(|| out.clone());
+
+                            // Update local cell.
+                            let mut state = cell.state.lock().await;
+                            *state = ErasedState::Ready {
+                                value: out.clone(),
+                                verified_at: rev,
+                                changed_at,
+                                deps: deps.clone(),
+                            };
+                            drop(state);
+                            cell.notify.notify_waiters();
+
+                            // Complete the global in-flight entry so followers can use the result.
+                            guard.complete(out, deps, changed_at);
+
+                            debug!(
+                                kind = self.kind.0,
+                                key_hash = %format!("{:016x}", key_hash),
+                                rev = rev.0,
+                                "compute: ok"
+                            );
+
+                            // 5) stale check
+                            if db.runtime().current_revision() == rev {
+                                return Ok(ErasedAccessResult {
+                                    value: out_value,
+                                    changed_at,
+                                });
+                            }
+                            continue;
+                        }
+                        Ok(Err(err)) => {
+                            let mut state = cell.state.lock().await;
+                            *state = ErasedState::Poisoned {
+                                error: err.clone(),
+                                verified_at: rev,
+                            };
+                            drop(state);
+                            cell.notify.notify_waiters();
+
+                            // Fail the global in-flight entry so followers get the error.
+                            guard.fail(err.clone());
+
+                            debug!(
+                                kind = self.kind.0,
+                                key_hash = %format!("{:016x}", key_hash),
+                                rev = rev.0,
+                                "compute: err"
+                            );
+
+                            if db.runtime().current_revision() == rev {
+                                return Err(err);
+                            }
+                            continue;
+                        }
+                        Err(panic_payload) => {
+                            let err = Arc::new(PicanteError::Panic {
+                                message: panic_message(panic_payload),
+                            });
+
+                            let mut state = cell.state.lock().await;
+                            *state = ErasedState::Poisoned {
+                                error: err.clone(),
+                                verified_at: rev,
+                            };
+                            drop(state);
+                            cell.notify.notify_waiters();
+
+                            // Fail the global in-flight entry so followers get the panic error.
+                            guard.fail(err.clone());
+
+                            debug!(
+                                kind = self.kind.0,
+                                key_hash = %format!("{:016x}", key_hash),
+                                rev = rev.0,
+                                "compute: panic"
+                            );
+
+                            if db.runtime().current_revision() == rev {
+                                return Err(err);
+                            }
+                            continue;
+                        }
                     }
-                    continue;
-                }
-                Err(panic_payload) => {
-                    let err = Arc::new(PicanteError::Panic {
-                        message: panic_message(panic_payload),
-                    });
-
-                    let mut state = cell.state.lock().await;
-                    *state = ErasedState::Poisoned {
-                        error: err.clone(),
-                        verified_at: rev,
-                    };
-                    drop(state);
-                    cell.notify.notify_waiters();
-
-                    debug!(
-                        kind = self.kind.0,
-                        key_hash = %format!("{:016x}", key_hash),
-                        rev = rev.0,
-                        "compute: panic"
-                    );
-
-                    if db.runtime().current_revision() == rev {
-                        return Err(err);
-                    }
-                    continue;
                 }
             }
         }
