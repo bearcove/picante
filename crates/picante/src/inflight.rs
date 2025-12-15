@@ -5,7 +5,7 @@
 //! computation across different database snapshots.
 
 use crate::error::PicanteError;
-use crate::key::{Dep, QueryKindId};
+use crate::key::{Dep, Key, QueryKindId};
 use crate::revision::Revision;
 use crate::runtime::RuntimeId;
 use dashmap::DashMap;
@@ -35,9 +35,8 @@ pub(crate) struct InFlightKey {
     pub runtime_id: RuntimeId,
     pub revision: Revision,
     pub kind: QueryKindId,
-    /// We use the key's hash for efficiency; collisions would just mean
-    /// slightly less sharing, not correctness issues.
-    pub key_hash: u64,
+    /// Full query key bytes; equality must be exact to preserve correctness.
+    pub key: Key,
 }
 
 /// State of an in-flight computation.
@@ -104,8 +103,8 @@ impl InFlightEntry {
     }
 
     /// Wait for the computation to complete.
-    pub(crate) async fn wait(&self) {
-        self.notify.notified().await;
+    pub(crate) fn notified(&self) -> impl std::future::Future<Output = ()> + '_ {
+        self.notify.notified()
     }
 }
 

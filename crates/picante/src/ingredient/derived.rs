@@ -166,6 +166,9 @@ impl DerivedCore {
 
         loop {
             let rev = db.runtime().current_revision();
+            // Create this before inspecting state to avoid missing a notification
+            // between observing `Running` and awaiting.
+            let notified = cell.notify.notified();
 
             // 1) fast path: read current state
             enum ErasedObserved {
@@ -174,7 +177,9 @@ impl DerivedCore {
                     changed_at: Revision,
                 },
                 Error(Arc<PicanteError>),
-                Running,
+                Running {
+                    started_at: Revision,
+                },
                 StaleReady {
                     deps: Arc<[Dep]>,
                     changed_at: Revision,
@@ -197,15 +202,9 @@ impl DerivedCore {
                     ErasedState::Poisoned { error, verified_at } if *verified_at == rev => {
                         ErasedObserved::Error(error.clone())
                     }
-                    ErasedState::Running { started_at } => {
-                        trace!(
-                            kind = self.kind.0,
-                            key_hash = %format!("{:016x}", key_hash),
-                            started_at = started_at.0,
-                            "wait on running cell"
-                        );
-                        ErasedObserved::Running
-                    }
+                    ErasedState::Running { started_at } => ErasedObserved::Running {
+                        started_at: *started_at,
+                    },
                     ErasedState::Ready {
                         deps, changed_at, ..
                     } => ErasedObserved::StaleReady {
@@ -230,9 +229,14 @@ impl DerivedCore {
                     }
                     continue;
                 }
-                ErasedObserved::Running => {
-                    // Running: wait for the owner to finish.
-                    cell.notify.notified().await;
+                ErasedObserved::Running { started_at } => {
+                    trace!(
+                        kind = self.kind.0,
+                        key_hash = %format!("{:016x}", key_hash),
+                        started_at = started_at.0,
+                        "wait on running cell"
+                    );
+                    notified.await;
                     continue;
                 }
                 ErasedObserved::StaleReady { deps, changed_at } => {
@@ -309,7 +313,7 @@ impl DerivedCore {
                 runtime_id: db.runtime().id(),
                 revision: rev,
                 kind: self.kind,
-                key_hash,
+                key: requested.key.clone(),
             };
 
             match inflight::try_lead(inflight_key.clone()) {
@@ -331,11 +335,12 @@ impl DerivedCore {
 
                     // Wait for the leader to complete.
                     loop {
+                        let notified = entry.notified();
                         let entry_state = entry.state();
                         match entry_state {
                             InFlightState::Running => {
                                 // Still computing, wait for notification.
-                                entry.wait().await;
+                                notified.await;
                             }
                             InFlightState::Done {
                                 value,
@@ -357,10 +362,18 @@ impl DerivedCore {
                                     value,
                                     verified_at: rev,
                                     changed_at,
-                                    deps,
+                                    deps: deps.clone(),
                                 };
                                 drop(state);
                                 cell.notify.notify_waiters();
+
+                                // Keep the dependency graph + events consistent even when the
+                                // computation happened in another runtime instance.
+                                db.runtime()
+                                    .update_query_deps(requested.clone(), deps.clone());
+                                if changed_at == rev {
+                                    db.runtime().notify_query_changed(rev, requested.clone());
+                                }
 
                                 if db.runtime().current_revision() == rev {
                                     return Ok(ErasedAccessResult {
