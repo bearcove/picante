@@ -329,6 +329,7 @@ mod tests {
     use std::collections::HashMap;
 
     // A type that does NOT implement PartialEq
+    #[allow(clippy::derived_hash_with_manual_eq)]
     #[derive(Facet, Debug, Clone, Hash, Eq)]
     struct NoPartialEq {
         value: i32,
