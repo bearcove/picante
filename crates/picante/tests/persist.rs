@@ -263,7 +263,7 @@ async fn load_cache_ignores_unknown_sections() {
 }
 
 #[tokio::test]
-async fn load_cache_kind_name_mismatch_is_corrupt() {
+async fn load_cache_kind_name_mismatch_is_warning() {
     init_tracing();
 
     let cache_path = temp_file("picante-kind-name-mismatch.bin");
@@ -286,6 +286,8 @@ async fn load_cache_kind_name_mismatch_is_corrupt() {
     let input: Arc<InputIngredient<String, String>> =
         Arc::new(InputIngredient::new(QueryKindId(1), "Text"));
 
+    // Kind name mismatches now produce warnings but still load the cache
+    // This allows for ingredient renames without invalidating the cache
     let ok = load_cache_with_options(
         &cache_path,
         db.runtime(),
@@ -298,7 +300,7 @@ async fn load_cache_kind_name_mismatch_is_corrupt() {
     .await
     .unwrap();
 
-    assert!(!ok);
+    assert!(ok);
     let _ = tokio::fs::remove_file(&cache_path).await;
 }
 

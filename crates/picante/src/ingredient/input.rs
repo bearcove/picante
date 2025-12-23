@@ -323,7 +323,12 @@ where
         })
     }
 
-    fn apply_wal_entry(&self, key: Vec<u8>, value: Option<Vec<u8>>) -> PicanteResult<()> {
+    fn apply_wal_entry(
+        &self,
+        revision: u64,
+        key: Vec<u8>,
+        value: Option<Vec<u8>>,
+    ) -> PicanteResult<()> {
         let key: K = facet_postcard::from_slice(&key).map_err(|e| {
             Arc::new(PicanteError::Decode {
                 what: "input key from WAL",
@@ -342,16 +347,13 @@ where
             None
         };
 
-        // Note: We don't know the exact revision when this was changed,
-        // but that's okay - we'll let the runtime assign the current revision
-        // during replay. The important thing is that we restore the value.
+        // Use the exact revision from the WAL entry
         let mut entries = self.entries.write();
         entries.insert(
             key,
             InputEntry {
                 value,
-                // Use revision 0 as a placeholder - the runtime will update this
-                changed_at: Revision(0),
+                changed_at: Revision(revision),
             },
         );
 

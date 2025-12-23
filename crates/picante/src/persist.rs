@@ -134,9 +134,15 @@ pub trait PersistableIngredient: Send + Sync {
 
     /// Apply a single incremental change from the WAL.
     ///
+    /// - `revision`: The revision when this change occurred
     /// - `key`: Serialized key
     /// - `value`: `Some(serialized_value)` for set/update, `None` for delete
-    fn apply_wal_entry(&self, _key: Vec<u8>, _value: Option<Vec<u8>>) -> PicanteResult<()> {
+    fn apply_wal_entry(
+        &self,
+        _revision: u64,
+        _key: Vec<u8>,
+        _value: Option<Vec<u8>>,
+    ) -> PicanteResult<()> {
         // Default: not implemented
         Ok(())
     }
@@ -338,14 +344,12 @@ async fn load_cache_inner(
         };
 
         if section.kind_name != ingredient.kind_name() {
-            return Err(Arc::new(PicanteError::Cache {
-                message: format!(
-                    "kind name mismatch for id {}: file has `{}`, runtime has `{}`",
-                    section.kind_id,
-                    section.kind_name,
-                    ingredient.kind_name()
-                ),
-            }));
+            warn!(
+                kind_id = section.kind_id,
+                file_kind_name = %section.kind_name,
+                runtime_kind_name = %ingredient.kind_name(),
+                "load_cache: kind name mismatch (ingredient may have been renamed)"
+            );
         }
 
         if section.section_type != ingredient.section_type() {
@@ -525,6 +529,17 @@ fn drop_one_record(
 ///
 /// This collects all changes from ingredients that occurred after `since_revision`
 /// and appends them to the WAL writer.
+///
+/// # Transactional Semantics
+///
+/// **Important**: This function does NOT provide atomic append semantics. If an error
+/// occurs mid-append (e.g., disk full, serialization failure), some entries may be
+/// written while others are not, leaving the WAL in a partially-written state. There
+/// is no rollback mechanism. Consider calling `wal.flush()` explicitly after this
+/// function to ensure all entries are persisted.
+///
+/// For production use, consider implementing periodic WAL compaction to create new
+/// base snapshots and validate WAL integrity.
 pub async fn append_to_wal(
     wal: &mut WalWriter,
     runtime: &Runtime,
@@ -571,13 +586,20 @@ pub async fn replay_wal(
 ) -> PicanteResult<usize> {
     let path = path.as_ref();
 
-    // If WAL doesn't exist, that's fine (nothing to replay)
-    if !path.exists() {
-        debug!("No WAL file found at {}, skipping replay", path.display());
-        return Ok(0);
-    }
-
-    let mut reader = WalReader::open(path)?;
+    // Try to open the WAL file. If it doesn't exist, that's fine (nothing to replay)
+    let mut reader = match WalReader::open(path) {
+        Ok(r) => r,
+        Err(e) => {
+            // Check if this is a "file not found" error
+            let err_msg = format!("{}", e);
+            if err_msg.contains("No such file") || err_msg.contains("not found") {
+                debug!("No WAL file found at {}, skipping replay", path.display());
+                return Ok(0);
+            }
+            // Otherwise, propagate the error
+            return Err(e);
+        }
+    };
     let base_revision = reader.header().base_revision;
 
     info!(
@@ -610,10 +632,10 @@ pub async fn replay_wal(
         // Apply the operation
         match entry.operation {
             WalOperation::Set { key, value } => {
-                ingredient.apply_wal_entry(key, Some(value))?;
+                ingredient.apply_wal_entry(entry.revision, key, Some(value))?;
             }
             WalOperation::Delete { key } => {
-                ingredient.apply_wal_entry(key, None)?;
+                ingredient.apply_wal_entry(entry.revision, key, None)?;
             }
         }
 
@@ -663,7 +685,7 @@ pub async fn compact_wal(
 
     // Delete the old WAL
     if wal_path.exists() {
-        std::fs::remove_file(wal_path).map_err(|e| {
+        tokio::fs::remove_file(wal_path).await.map_err(|e| {
             Arc::new(PicanteError::Cache {
                 message: format!("Failed to delete old WAL at {}: {}", wal_path.display(), e),
             })

@@ -10,6 +10,14 @@
 //! - **WAL entries**: Appended after snapshot, records changes since base revision
 //! - **Compaction**: Periodically create new snapshot and discard old WAL
 //!
+//! # Limitations
+//!
+//! **Interned ingredients**: Interned values are NOT included in incremental WAL entries.
+//! They are only persisted in base snapshots. This is because interned values are typically
+//! small and infrequently changing, so the overhead of incremental tracking doesn't justify
+//! the complexity. If you're using interned ingredients, be aware that new intern operations
+//! between snapshots will not be persisted to the WAL.
+//!
 //! # Usage
 //!
 //! ```rust,ignore
@@ -95,10 +103,39 @@ pub struct WalWriter {
 }
 
 impl WalWriter {
-    /// Create a new WAL file, writing the header.
+    /// Default auto-flush threshold (number of entries before auto-flush).
+    ///
+    /// This value of 100 balances write performance with data durability.
+    /// Lower values increase durability but may reduce write throughput.
+    /// Higher values improve performance but increase risk of data loss on crash.
+    pub const DEFAULT_AUTO_FLUSH_THRESHOLD: usize = 100;
+
+    /// Create a new WAL file with default settings.
+    ///
+    /// Uses the default auto-flush threshold. For custom settings, use
+    /// `create_with_threshold()`.
     ///
     /// If a file already exists at this path, it will be truncated.
     pub fn create(path: impl AsRef<Path>, base_revision: u64) -> PicanteResult<Self> {
+        Self::create_with_threshold(path, base_revision, Self::DEFAULT_AUTO_FLUSH_THRESHOLD)
+    }
+
+    /// Create a new WAL file with a custom auto-flush threshold.
+    ///
+    /// The `auto_flush_threshold` determines how many entries are buffered
+    /// before automatically flushing to disk:
+    ///
+    /// - **Lower values (e.g., 10-50)**: Better durability, less data loss on crash,
+    ///   but more disk I/O overhead
+    /// - **Higher values (e.g., 200-1000)**: Better write performance, but more
+    ///   entries could be lost if the process crashes before flush
+    ///
+    /// If a file already exists at this path, it will be truncated.
+    pub fn create_with_threshold(
+        path: impl AsRef<Path>,
+        base_revision: u64,
+        auto_flush_threshold: usize,
+    ) -> PicanteResult<Self> {
         let path = path.as_ref().to_path_buf();
 
         let file = OpenOptions::new()
@@ -157,7 +194,7 @@ impl WalWriter {
             writer,
             base_revision,
             entries_since_flush: 0,
-            auto_flush_threshold: 100,
+            auto_flush_threshold,
         })
     }
 
@@ -224,7 +261,13 @@ impl WalWriter {
 impl Drop for WalWriter {
     fn drop(&mut self) {
         // Best-effort flush on drop
-        let _ = self.flush();
+        if let Err(e) = self.flush() {
+            tracing::warn!(
+                path = %self.path.display(),
+                error = %e,
+                "Failed to flush WAL on drop - unflushed entries may be lost"
+            );
+        }
     }
 }
 
@@ -275,6 +318,17 @@ impl WalReader {
             })
         })?;
         let header_len = u32::from_le_bytes(header_len_bytes) as usize;
+
+        // Sanity check: header should not be larger than 1 MB
+        const MAX_HEADER_LEN: usize = 1_000_000;
+        if header_len > MAX_HEADER_LEN {
+            return Err(Arc::new(PicanteError::Cache {
+                message: format!(
+                    "WAL header length ({} bytes) exceeds maximum allowed ({} bytes) - file may be corrupted",
+                    header_len, MAX_HEADER_LEN
+                ),
+            }));
+        }
 
         // Read header
         let mut header_bytes = vec![0u8; header_len];
@@ -333,6 +387,18 @@ impl WalReader {
         }
 
         let entry_len = u32::from_le_bytes(entry_len_bytes) as usize;
+
+        // Sanity check: entry should not be larger than 100 MB
+        // (A reasonable upper bound for a single cache entry)
+        const MAX_ENTRY_LEN: usize = 100_000_000;
+        if entry_len > MAX_ENTRY_LEN {
+            return Err(Arc::new(PicanteError::Cache {
+                message: format!(
+                    "WAL entry length ({} bytes) exceeds maximum allowed ({} bytes) - file may be corrupted",
+                    entry_len, MAX_ENTRY_LEN
+                ),
+            }));
+        }
 
         // Read entry
         let mut entry_bytes = vec![0u8; entry_len];

@@ -234,7 +234,12 @@ where
         })
     }
 
-    fn apply_wal_entry(&self, _key: Vec<u8>, value: Option<Vec<u8>>) -> PicanteResult<()> {
+    fn apply_wal_entry(
+        &self,
+        _revision: u64,
+        _key: Vec<u8>,
+        value: Option<Vec<u8>>,
+    ) -> PicanteResult<()> {
         // Even though we don't generate incremental records for interned ingredients,
         // we should still be able to apply them if they somehow exist in the WAL
         // (e.g., from a future version that does track them).

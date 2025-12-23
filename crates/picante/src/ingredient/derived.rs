@@ -1230,7 +1230,9 @@ where
                 };
 
                 // Only include entries that changed after the base revision
-                if changed_at.0 <= since_revision {
+                if changed_at.0 > since_revision {
+                    // Entry was modified after the snapshot, include it
+                } else {
                     continue;
                 }
 
@@ -1301,7 +1303,12 @@ where
         })
     }
 
-    fn apply_wal_entry(&self, key: Vec<u8>, value: Option<Vec<u8>>) -> PicanteResult<()> {
+    fn apply_wal_entry(
+        &self,
+        _revision: u64,
+        key: Vec<u8>,
+        value: Option<Vec<u8>>,
+    ) -> PicanteResult<()> {
         let key: K = facet_postcard::from_slice(&key).map_err(|e| {
             Arc::new(PicanteError::Decode {
                 what: "derived key from WAL",
