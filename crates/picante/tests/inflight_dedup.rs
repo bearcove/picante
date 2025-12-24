@@ -39,7 +39,7 @@ pub struct Database {}
 /// This test reproduces the bug described in issue #27: when multiple concurrent tasks
 /// each create a DatabaseSnapshot and query the same tracked function with the same key,
 /// the computation runs once per snapshot instead of being shared.
-#[tokio::test(flavor = "current_thread")]
+#[tokio_test_lite::test]
 async fn concurrent_snapshot_queries_should_deduplicate() -> PicanteResult<()> {
     // Reset the counter
     SLOW_COMPUTE_COUNT.store(0, Ordering::SeqCst);
@@ -95,7 +95,7 @@ async fn concurrent_snapshot_queries_should_deduplicate() -> PicanteResult<()> {
 
 /// Control test: verify that within a single DB instance, the existing Running
 /// state deduplication already works.
-#[tokio::test(flavor = "current_thread")]
+#[tokio_test_lite::test]
 async fn single_db_queries_already_deduplicate() -> PicanteResult<()> {
     // Use a separate counter for this test
     static SINGLE_DB_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -161,7 +161,7 @@ async fn single_db_queries_already_deduplicate() -> PicanteResult<()> {
 
 /// Test that when the leader task is cancelled, followers can retry and one
 /// becomes the new leader to complete the computation.
-#[tokio::test(flavor = "current_thread")]
+#[tokio_test_lite::test]
 async fn cancellation_allows_follower_retry() -> PicanteResult<()> {
     static CANCEL_COMPUTE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -256,7 +256,7 @@ async fn cancellation_allows_follower_retry() -> PicanteResult<()> {
 }
 
 /// Test that errors from the leader are propagated to followers.
-#[tokio::test(flavor = "current_thread")]
+#[tokio_test_lite::test]
 async fn error_propagation_to_followers() -> PicanteResult<()> {
     static ERROR_COMPUTE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
