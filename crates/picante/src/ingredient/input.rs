@@ -6,7 +6,7 @@ use crate::persist::{PersistableIngredient, SectionType};
 use crate::revision::Revision;
 use crate::runtime::HasRuntime;
 use facet::Facet;
-use futures::future::BoxFuture;
+use futures_util::future::BoxFuture;
 use parking_lot::RwLock;
 use std::hash::Hash;
 use std::sync::Arc;

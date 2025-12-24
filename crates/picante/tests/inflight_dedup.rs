@@ -3,6 +3,7 @@
 //! These tests verify that concurrent requests for the same tracked query
 //! with identical parameters coalesce into a single computation.
 
+use futures_util::future;
 use picante::PicanteResult;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -70,7 +71,7 @@ async fn concurrent_snapshot_queries_should_deduplicate() -> PicanteResult<()> {
         .collect();
 
     // Wait for all tasks to complete
-    let results: Vec<_> = futures::future::join_all(handles)
+    let results: Vec<_> = future::join_all(handles)
         .await
         .into_iter()
         .map(|r| r.expect("task panicked"))
@@ -137,7 +138,7 @@ async fn single_db_queries_already_deduplicate() -> PicanteResult<()> {
         })
         .collect();
 
-    let results: Vec<_> = futures::future::join_all(handles)
+    let results: Vec<_> = future::join_all(handles)
         .await
         .into_iter()
         .map(|r| r.expect("task panicked"))
@@ -228,7 +229,7 @@ async fn cancellation_allows_follower_retry() -> PicanteResult<()> {
     leader_handle.abort();
 
     // Wait for followers to complete
-    let results: Vec<_> = futures::future::join_all(follower_handles)
+    let results: Vec<_> = future::join_all(follower_handles)
         .await
         .into_iter()
         .map(|r| r.expect("follower task panicked"))
@@ -305,7 +306,7 @@ async fn error_propagation_to_followers() -> PicanteResult<()> {
         .collect();
 
     // Wait for all tasks
-    let results: Vec<_> = futures::future::join_all(handles)
+    let results: Vec<_> = future::join_all(handles)
         .await
         .into_iter()
         .map(|r| r.expect("task panicked"))

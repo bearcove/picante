@@ -7,7 +7,7 @@ use crate::revision::Revision;
 use crate::runtime::HasRuntime;
 use dashmap::DashMap;
 use facet::Facet;
-use futures::future::BoxFuture;
+use futures_util::future::BoxFuture;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tracing::{debug, trace};
