@@ -161,6 +161,7 @@ impl InputCore {
 // Helper functions to create persistence callbacks (monomorphized per K,V)
 // ============================================================================
 
+// r[input.constraints]
 fn make_encode_input_record<K, V>() -> EncodeInputRecordFn
 where
     K: Clone + Eq + Hash + Facet<'static> + Send + Sync + 'static,
@@ -324,6 +325,7 @@ pub struct InputEntry<V> {
     pub changed_at: Revision,
 }
 
+// r[input.type]
 /// A key-value input ingredient.
 ///
 /// Reads record dependencies into the current query frame (if one exists).
@@ -375,6 +377,8 @@ where
         self.core.kind_name
     }
 
+    // r[input.set]
+    // r[input.revision-on-change]
     /// Set an input value.
     ///
     /// Bumps the runtime revision only if the value actually changed.
@@ -424,6 +428,7 @@ where
         rev
     }
 
+    // r[input.remove]
     /// Remove an input value.
     ///
     /// Bumps the runtime revision only if the value existed.
@@ -476,6 +481,7 @@ where
         rev
     }
 
+    // r[input.get]
     /// Read an input value.
     ///
     /// If there's an active query frame, records a dependency edge.
@@ -515,6 +521,7 @@ where
         entries.get(&dyn_key).map(|e| e.changed_at)
     }
 
+    // r[snapshot.input]
     /// Create a snapshot of this ingredient's data.
     ///
     /// This is an O(1) operation due to structural sharing in `im::HashMap`.
