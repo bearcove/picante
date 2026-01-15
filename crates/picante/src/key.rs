@@ -6,6 +6,7 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+// r[kind.type]
 /// Stable identifier for a query/input kind.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct QueryKindId(pub u32);
@@ -16,6 +17,10 @@ impl QueryKindId {
         self.0
     }
 
+    // r[kind.hash]
+    // r[kind.stability]
+    // r[kind.collision]
+    // r[kind.uniqueness]
     /// Create a stable id from a string.
     ///
     /// This is intended for macro-generated kind ids, which must remain stable
@@ -24,21 +29,23 @@ impl QueryKindId {
     /// The hash algorithm is a 32-bit FNV-1a over UTF-8 bytes.
     pub const fn from_str(s: &str) -> Self {
         let bytes = s.as_bytes();
-        let mut hash: u32 = 0x811c9dc5;
+        let mut hash: u32 = 0x811c9dc5; // FNV_OFFSET
         let mut i = 0usize;
         while i < bytes.len() {
             hash ^= bytes[i] as u32;
-            hash = hash.wrapping_mul(0x0100_0193);
+            hash = hash.wrapping_mul(0x0100_0193); // FNV_PRIME
             i += 1;
         }
         QueryKindId(hash)
     }
 }
 
+// r[key.encoding]
 /// Postcard-encoded bytes for a key, plus a deterministic hash for tracing/debugging.
 #[derive(Clone)]
 pub struct Key {
     bytes: Arc<[u8]>,
+    // r[key.hash]
     hash: u64,
 }
 
@@ -94,8 +101,10 @@ impl Key {
     }
 }
 
+// r[key.equality]
 impl PartialEq for Key {
     fn eq(&self, other: &Self) -> bool {
+        // exact byte equality, not hash
         self.bytes == other.bytes
     }
 }
@@ -117,6 +126,7 @@ impl fmt::Debug for Key {
     }
 }
 
+// r[key.dyn-key]
 /// Erased key for diagnostics/cycle detection.
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
 pub struct DynKey {
@@ -126,6 +136,7 @@ pub struct DynKey {
     pub key: Key,
 }
 
+// r[key.dep]
 /// A recorded dependency edge.
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
 pub struct Dep {

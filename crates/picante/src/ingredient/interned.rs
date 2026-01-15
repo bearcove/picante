@@ -12,11 +12,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tracing::{debug, trace};
 
+// r[interned.id-type]
 /// An identifier returned from [`InternedIngredient::intern`].
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Facet)]
 #[repr(transparent)]
 pub struct InternId(pub u32);
 
+// r[interned.type]
+// r[interned.stability]
 /// An ingredient that interns values and returns stable ids.
 ///
 /// Interned values are immutable: interning does **not** bump the database revision.
@@ -28,6 +31,7 @@ pub struct InternedIngredient<K> {
     by_id: DashMap<InternId, Arc<K>>,
 }
 
+// r[interned.constraints]
 impl<K> InternedIngredient<K>
 where
     K: Facet<'static> + Send + Sync + 'static,
@@ -53,6 +57,7 @@ where
         self.kind_name
     }
 
+    // r[interned.intern]
     /// Intern `value` and return its stable id.
     pub fn intern(&self, value: K) -> PicanteResult<InternId> {
         let _span = tracing::debug_span!("intern", kind = self.kind.0).entered();
@@ -76,6 +81,7 @@ where
         }
     }
 
+    // r[interned.get]
     /// Look up an interned value by id.
     ///
     /// If there's an active query frame, records a dependency edge.
