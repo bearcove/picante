@@ -1228,16 +1228,13 @@ where
 
         // Ensure we have a task-local query stack (required for cycle detection + dep tracking).
         // Use scope_if_needed_boxed to avoid monomorphization per (DB, K, V).
-        let result = frame::scope_if_needed_boxed(Box::pin(
-            self.core
-                .access_scoped_erased(
-                    db,
-                    dyn_key.clone(),
-                    true,
-                    self.compute.as_ref(),
-                    self.eq_erased,
-                )
-        ))
+        let result = frame::scope_if_needed_boxed(Box::pin(self.core.access_scoped_erased(
+            db,
+            dyn_key.clone(),
+            true,
+            self.compute.as_ref(),
+            self.eq_erased,
+        )))
         .await?;
 
         // Downcast at the boundary - MUST succeed due to type safety
@@ -1276,10 +1273,13 @@ where
         // Ensure we have a task-local query stack (required for cycle detection + dep tracking).
         // Note: touch may still compute/revalidate; it just doesn't return the value to the caller.
         // Use scope_if_needed_boxed to avoid monomorphization per (DB, K, V).
-        let result = frame::scope_if_needed_boxed(Box::pin(
-            self.core
-                .access_scoped_erased(db, dyn_key, false, self.compute.as_ref(), self.eq_erased)
-        ))
+        let result = frame::scope_if_needed_boxed(Box::pin(self.core.access_scoped_erased(
+            db,
+            dyn_key,
+            false,
+            self.compute.as_ref(),
+            self.eq_erased,
+        )))
         .await?;
 
         Ok(result.changed_at)
