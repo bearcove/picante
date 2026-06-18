@@ -1,3 +1,13 @@
+> [!IMPORTANT]
+> Picante now lives in the Facet monorepo.
+
+Use [`picante`](https://github.com/facet-rs/facet/tree/main/picante) and
+[`picante-macros`](https://github.com/facet-rs/facet/tree/main/picante-macros)
+from [`facet-rs/facet`](https://github.com/facet-rs/facet) for new issues,
+pull requests, releases, and documentation.
+
+After this redirect lands, this repository will be archived.
+
 **picante** is an **async** incremental query runtime for Rust, inspired by Salsa but built for **Tokio-first** pipelines (like Dodeca).
 
 **What it has today**
